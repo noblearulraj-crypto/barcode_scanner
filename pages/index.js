@@ -56,38 +56,40 @@ export default function Home() {
   // ── Canvas-based preprocessing pipeline ──────────────────────────────────
   const getImageVariants = useCallback((img) => {
     const variants = [];
-    const rotations = [0, 90, 180, 270];
+    // 45-degree increments to catch off-angle/tilted barcodes
+    const rotations = [0, 45, 90, 135, 180, 225, 270, 315];
 
-    // Pre-calculate normalization (Downscale large images for better feature detection)
-    const MAX_DIM = 1200;
-    let sw = img.naturalWidth || img.width;
-    let sh = img.naturalHeight || img.height;
-    let scale = 1;
-    if (sw > MAX_DIM || sh > MAX_DIM) {
-      scale = Math.min(MAX_DIM / sw, MAX_DIM / sh);
-      sw *= scale;
-      sh *= scale;
-    }
+    // Multi-scale normalization: Large for detail, small to ignore blur/noise
+    const targetDims = [1200, 800];
 
-    rotations.forEach(deg => {
-      const c = document.createElement('canvas');
-      const radians = (deg * Math.PI) / 180;
-      if (deg === 90 || deg === 270) {
-        c.width = img.height; c.height = img.width;
-      } else {
-        c.width = img.width; c.height = img.height;
-      }
-      // If we scaled, use the calculated dimensions
-      if (scale < 1) {
-        if (deg === 90 || deg === 270) { c.width = sh; c.height = sw; }
-        else { c.width = sw; c.height = sh; }
-      }
+    targetDims.forEach(target => {
+      let sw = img.naturalWidth || img.width;
+      let sh = img.naturalHeight || img.height;
+      const scale = Math.min(target / sw, target / sh, 1);
+      const dw = sw * scale;
+      const dh = sh * scale;
 
-      const ctx = c.getContext('2d', { alpha: false });
-      ctx.translate(c.width / 2, c.height / 2);
-      ctx.rotate(radians);
-      ctx.drawImage(img, -sw / 2, -sh / 2, sw, sh);
-      variants.push({ canvas: c, label: `raw|${deg}°` });
+      rotations.forEach(deg => {
+        const c = document.createElement('canvas');
+        const radians = (deg * Math.PI) / 180;
+        
+        // Calculate bounds for any rotation angle
+        if (deg % 180 === 90) {
+          c.width = dh; c.height = dw;
+        } else {
+          c.width = dw; c.height = dh;
+        }
+
+        const ctx = c.getContext('2d', { alpha: false, desynchronized: true });
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        
+        ctx.translate(c.width / 2, c.height / 2);
+        ctx.rotate(radians);
+        ctx.drawImage(img, -dw / 2, -dh / 2, dw, dh);
+        
+        const labelSuffix = `${target}px|${deg}°`;
+        variants.push({ canvas: c, label: `raw|${labelSuffix}` });
 
       // Grayscale + threshold
       const c2 = document.createElement('canvas');
@@ -95,30 +97,34 @@ export default function Home() {
       const ctx2 = c2.getContext('2d');
       ctx2.drawImage(c, 0, 0);
       const id = ctx2.getImageData(0, 0, c2.width, c2.height);
+      
+      // Faster Grayscale + Adaptive-like thresholding logic
       for (let i = 0; i < id.data.length; i += 4) {
         const v = id.data[i] * 0.299 + id.data[i+1] * 0.587 + id.data[i+2] * 0.114;
-        const bw = v > 128 ? 255 : 0;
+        // Using a slightly lower threshold (110) often helps with thin 1D bars
+        const bw = v > 110 ? 255 : 0;
         id.data[i] = id.data[i+1] = id.data[i+2] = bw;
       }
       ctx2.putImageData(id, 0, 0);
-      variants.push({ canvas: c2, label: `thresh|${deg}°` });
+      variants.push({ canvas: c2, label: `thresh|${labelSuffix}` });
 
-      // High Contrast + Sharpening (Great for CLI-like power)
+      // Pass 2.3: Deep Sharp (Unsharp Mask simulation)
+      // Extreme contrast and brightness tuning to fix blur-induced bleeding
       const c5 = document.createElement('canvas');
       c5.width = c.width; c5.height = c.height;
       const ctx5 = c5.getContext('2d');
-      // Apply a "unsharp mask" style filter via CSS context
-      ctx5.filter = 'contrast(180%) brightness(110%) saturate(0) blur(0px) contrast(2)';
+      ctx5.filter = 'grayscale(1) brightness(1.1) contrast(4) saturate(0) contrast(2)';
       ctx5.drawImage(c, 0, 0);
-      variants.push({ canvas: c5, label: `contrast|${deg}°` });
+      variants.push({ canvas: c5, label: `edge|${labelSuffix}` });
 
-      // Inverted
+      // Inverted (Required for some industrial markings/dark mode QRs)
       const c4 = document.createElement('canvas');
       c4.width = c.width; c4.height = c.height;
       const ctx4 = c4.getContext('2d');
-      ctx4.filter = 'invert(1)';
+      ctx4.filter = 'invert(1) grayscale(1) contrast(2)';
       ctx4.drawImage(c, 0, 0);
-      variants.push({ canvas: c4, label: `inv|${deg}°` });
+      variants.push({ canvas: c4, label: `inv|${labelSuffix}` });
+      });
     });
 
     return variants;
@@ -142,7 +148,6 @@ export default function Home() {
     return null;
   }, []);
 
-  // ── Manual EAN-13 decoder ─────────────────────────────────────────────────
   const EAN_L = {'0001101':'0','0011001':'1','0010011':'2','0111101':'3','0100011':'4','0110001':'5','0101111':'6','0111011':'7','0110111':'8','0001011':'9'};
   const EAN_G = {'0100111':'0','0110011':'1','0011011':'2','0100001':'3','0011101':'4','0111001':'5','0000101':'6','0010001':'7','0001001':'8','0010111':'9'};
   const EAN_R = {'1110010':'0','1100110':'1','1101100':'2','1000010':'3','1011100':'4','1001110':'5','1010000':'6','1000100':'7','1001000':'8','1110100':'9'};
@@ -264,22 +269,25 @@ export default function Home() {
 
       // Pass 3 – 1D projection
       setPass(3);
-      for (const { canvas, label } of variants.slice(0, 8)) {
-        const signal = extractSignalFromCanvas(canvas);
-        const synth = document.createElement('canvas');
-        synth.width = signal.length; synth.height = 80;
-        const ctx = synth.getContext('2d');
-        const imgData = ctx.createImageData(signal.length, 80);
-        for (let y = 0; y < 80; y++) {
-          for (let x = 0; x < signal.length; x++) {
-            const v = signal[x] > 128 ? 255 : 0;
-            const i = (y * signal.length + x) * 4;
-            imgData.data[i] = imgData.data[i+1] = imgData.data[i+2] = v;
-            imgData.data[i+3] = 255;
+      // Try top (25%), mid (50%), and bottom (75%) stripes for every variant
+      for (const { canvas, label } of variants.slice(0, 16)) {
+        for (const yOff of [0.25, 0.5, 0.75]) {
+          const signal = extractSignalFromCanvas(canvas, yOff);
+          const synth = document.createElement('canvas');
+          synth.width = signal.length; synth.height = 60;
+          const ctx = synth.getContext('2d');
+          const imgData = ctx.createImageData(signal.length, 60);
+          for (let y = 0; y < 60; y++) {
+            for (let x = 0; x < signal.length; x++) {
+              const v = signal[x] > 120 ? 255 : 0;
+              const i = (y * signal.length + x) * 4;
+              imgData.data[i] = imgData.data[i+1] = imgData.data[i+2] = v;
+              imgData.data[i+3] = 255;
+            }
           }
+          ctx.putImageData(imgData, 0, 0);
+          addResult(await decodeCanvas(synth, `1D|${yOff}|${label}`));
         }
-        ctx.putImageData(imgData, 0, 0);
-        addResult(await decodeCanvas(synth, `1Dproj|${label}`));
       }
 
       // Pass 4 – manual EAN-13
