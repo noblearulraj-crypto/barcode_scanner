@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import Head from 'next/head';
-import { BrowserMultiFormatReader, NotFoundException, DecodeHintType } from '@zxing/library';
+import { BrowserMultiFormatReader, NotFoundException, DecodeHintType, BarcodeFormat } from '@zxing/library';
 
 const PASS_LABELS = [
   { id: 1, label: 'Direct decode', desc: 'Fast path — clean images' },
@@ -28,9 +28,24 @@ export default function Home() {
 
   // ── ZXing reader singleton ────────────────────────────────────────────────
   useEffect(() => {
+    const formats = [
+      BarcodeFormat.QR_CODE,
+      BarcodeFormat.EAN_13,
+      BarcodeFormat.EAN_8,
+      BarcodeFormat.UPC_A,
+      BarcodeFormat.UPC_E,
+      BarcodeFormat.CODE_128,
+      BarcodeFormat.CODE_39,
+      BarcodeFormat.CODE_93,
+      BarcodeFormat.ITF,
+      BarcodeFormat.DATA_MATRIX,
+      BarcodeFormat.PDF_417,
+      BarcodeFormat.AZTEC,
+    ];
     const hints = new Map();
     hints.set(DecodeHintType.TRY_HARDER, true);
     hints.set(DecodeHintType.ASSUME_GS1, true);
+    hints.set(DecodeHintType.POSSIBLE_FORMATS, formats);
     readerRef.current = new BrowserMultiFormatReader(hints);
     return () => {
       readerRef.current?.reset();
@@ -43,6 +58,17 @@ export default function Home() {
     const variants = [];
     const rotations = [0, 90, 180, 270];
 
+    // Pre-calculate normalization (Downscale large images for better feature detection)
+    const MAX_DIM = 1200;
+    let sw = img.naturalWidth || img.width;
+    let sh = img.naturalHeight || img.height;
+    let scale = 1;
+    if (sw > MAX_DIM || sh > MAX_DIM) {
+      scale = Math.min(MAX_DIM / sw, MAX_DIM / sh);
+      sw *= scale;
+      sh *= scale;
+    }
+
     rotations.forEach(deg => {
       const c = document.createElement('canvas');
       const radians = (deg * Math.PI) / 180;
@@ -51,10 +77,16 @@ export default function Home() {
       } else {
         c.width = img.width; c.height = img.height;
       }
-      const ctx = c.getContext('2d');
+      // If we scaled, use the calculated dimensions
+      if (scale < 1) {
+        if (deg === 90 || deg === 270) { c.width = sh; c.height = sw; }
+        else { c.width = sw; c.height = sh; }
+      }
+
+      const ctx = c.getContext('2d', { alpha: false });
       ctx.translate(c.width / 2, c.height / 2);
       ctx.rotate(radians);
-      ctx.drawImage(img, -img.width / 2, -img.height / 2);
+      ctx.drawImage(img, -sw / 2, -sh / 2, sw, sh);
       variants.push({ canvas: c, label: `raw|${deg}°` });
 
       // Grayscale + threshold
@@ -71,21 +103,12 @@ export default function Home() {
       ctx2.putImageData(id, 0, 0);
       variants.push({ canvas: c2, label: `thresh|${deg}°` });
 
-      // Upscaled (with safety cap)
-      const c3 = document.createElement('canvas');
-      const maxDim = Math.max(c.width, c.height);
-      const scale = maxDim < 1000 ? 3 : maxDim < 2000 ? 1.5 : 1; 
-      c3.width = c.width * scale; c3.height = c.height * scale;
-      const ctx3 = c3.getContext('2d');
-      ctx3.imageSmoothingEnabled = false;
-      ctx3.drawImage(c, 0, 0, c3.width, c3.height);
-      variants.push({ canvas: c3, label: `up3x|${deg}°` });
-
-      // High Contrast
+      // High Contrast + Sharpening (Great for CLI-like power)
       const c5 = document.createElement('canvas');
       c5.width = c.width; c5.height = c.height;
       const ctx5 = c5.getContext('2d');
-      ctx5.filter = 'contrast(200%) brightness(110%)';
+      // Apply a "unsharp mask" style filter via CSS context
+      ctx5.filter = 'contrast(180%) brightness(110%) saturate(0) blur(0px) contrast(2)';
       ctx5.drawImage(c, 0, 0);
       variants.push({ canvas: c5, label: `contrast|${deg}°` });
 
