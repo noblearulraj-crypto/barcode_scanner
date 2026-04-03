@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import Head from 'next/head';
-import { BrowserMultiFormatReader, NotFoundException } from '@zxing/library';
+import { BrowserMultiFormatReader, NotFoundException, DecodeHintType } from '@zxing/library';
 
 const PASS_LABELS = [
   { id: 1, label: 'Direct decode', desc: 'Fast path — clean images' },
@@ -28,7 +28,10 @@ export default function Home() {
 
   // ── ZXing reader singleton ────────────────────────────────────────────────
   useEffect(() => {
-    readerRef.current = new BrowserMultiFormatReader();
+    const hints = new Map();
+    hints.set(DecodeHintType.TRY_HARDER, true);
+    hints.set(DecodeHintType.ASSUME_GS1, true);
+    readerRef.current = new BrowserMultiFormatReader(hints);
     return () => {
       readerRef.current?.reset();
       stopCamera();
@@ -68,13 +71,23 @@ export default function Home() {
       ctx2.putImageData(id, 0, 0);
       variants.push({ canvas: c2, label: `thresh|${deg}°` });
 
-      // Upscaled
+      // Upscaled (with safety cap)
       const c3 = document.createElement('canvas');
-      c3.width = c.width * 3; c3.height = c.height * 3;
+      const maxDim = Math.max(c.width, c.height);
+      const scale = maxDim < 1000 ? 3 : maxDim < 2000 ? 1.5 : 1; 
+      c3.width = c.width * scale; c3.height = c.height * scale;
       const ctx3 = c3.getContext('2d');
       ctx3.imageSmoothingEnabled = false;
       ctx3.drawImage(c, 0, 0, c3.width, c3.height);
       variants.push({ canvas: c3, label: `up3x|${deg}°` });
+
+      // High Contrast
+      const c5 = document.createElement('canvas');
+      c5.width = c.width; c5.height = c.height;
+      const ctx5 = c5.getContext('2d');
+      ctx5.filter = 'contrast(200%) brightness(110%)';
+      ctx5.drawImage(c, 0, 0);
+      variants.push({ canvas: c5, label: `contrast|${deg}°` });
 
       // Inverted
       const c4 = document.createElement('canvas');
