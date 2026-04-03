@@ -113,7 +113,7 @@ export default function Home() {
       const c5 = document.createElement('canvas');
       c5.width = c.width; c5.height = c.height;
       const ctx5 = c5.getContext('2d');
-      ctx5.filter = 'grayscale(1) brightness(1.1) contrast(4) saturate(0) contrast(2)';
+      ctx5.filter = 'grayscale(1) brightness(1.2) contrast(5) contrast(2)';
       ctx5.drawImage(c, 0, 0);
       variants.push({ canvas: c5, label: `edge|${labelSuffix}` });
 
@@ -191,25 +191,24 @@ export default function Home() {
     return null;
   }, []);
 
-  const extractSignalFromCanvas = useCallback((canvas) => {
+  const extractSignalFromCanvas = useCallback((canvas, yPercent = 0.5) => {
     const ctx = canvas.getContext('2d');
     const { width: w, height: h } = canvas;
-    const top = Math.floor(h * 0.35);
-    const bot = Math.floor(h * 0.65);
-    const band = ctx.getImageData(0, top, w, bot - top);
+    // Very thin band (5px) prevents signal blurring if the barcode is tilted
+    const thickness = 5;
+    const centerY = Math.floor(h * yPercent);
+    const startY = Math.max(0, centerY - 2);
+    const band = ctx.getImageData(0, startY, w, thickness);
     const signal = new Float32Array(w);
-    const rows = bot - top;
     for (let x = 0; x < w; x++) {
       let sum = 0;
-      for (let y = 0; y < rows; y++) {
+      for (let y = 0; y < thickness; y++) {
         const idx = (y * w + x) * 4;
         sum += band.data[idx]*0.299 + band.data[idx+1]*0.587 + band.data[idx+2]*0.114;
       }
-      signal[x] = sum / rows;
+      signal[x] = sum / thickness;
     }
-    const mn = Math.min(...signal), mx = Math.max(...signal);
-    if (mx === mn) return new Uint8Array(w);
-    return Uint8Array.from(signal, v => Math.round((v-mn)/(mx-mn)*255));
+    return signal;
   }, []);
 
   const getRuns = (arr) => {
@@ -269,19 +268,30 @@ export default function Home() {
 
       // Pass 3 – 1D projection
       setPass(3);
-      // Try top (25%), mid (50%), and bottom (75%) stripes for every variant
-      for (const { canvas, label } of variants.slice(0, 16)) {
-        for (const yOff of [0.25, 0.5, 0.75]) {
+      // Scan 5 vertical positions across all variants to find a clear path
+      for (const { canvas, label } of variants.slice(0, 24)) {
+        for (const yOff of [0.2, 0.35, 0.5, 0.65, 0.8]) {
           const signal = extractSignalFromCanvas(canvas, yOff);
+          
+          // Adaptive 1D Thresholding (the "CLI secret sauce")
+          const binary = new Uint8Array(signal.length);
+          const win = Math.max(4, Math.floor(signal.length / 60));
+          for (let i = 0; i < signal.length; i++) {
+            let s = 0, c = 0;
+            for (let j = i - win; j <= i + win; j++) {
+              if (j >= 0 && j < signal.length) { s += signal[j]; c++; }
+            }
+            binary[i] = signal[i] < (s / c) * 0.92 ? 0 : 255;
+          }
+
           const synth = document.createElement('canvas');
           synth.width = signal.length; synth.height = 60;
           const ctx = synth.getContext('2d');
           const imgData = ctx.createImageData(signal.length, 60);
           for (let y = 0; y < 60; y++) {
             for (let x = 0; x < signal.length; x++) {
-              const v = signal[x] > 120 ? 255 : 0;
               const i = (y * signal.length + x) * 4;
-              imgData.data[i] = imgData.data[i+1] = imgData.data[i+2] = v;
+              imgData.data[i] = imgData.data[i+1] = imgData.data[i+2] = binary[x];
               imgData.data[i+3] = 255;
             }
           }
@@ -292,11 +302,19 @@ export default function Home() {
 
       // Pass 4 – manual EAN-13
       setPass(4);
-      for (const { canvas } of variants.slice(0, 8)) {
-        const signal = extractSignalFromCanvas(canvas);
-        const binary = Uint8Array.from(signal, v => v > 128 ? 255 : 0);
+      for (const { canvas } of variants.slice(0, 12)) {
+        const signal = extractSignalFromCanvas(canvas, 0.5);
+        const binary = new Uint8Array(signal.length);
+        const win = Math.max(4, Math.floor(signal.length / 50));
+        for (let i = 0; i < signal.length; i++) {
+          let s = 0, c = 0;
+          for (let j = i - win; j <= i + win; j++) {
+            if (j >= 0 && j < signal.length) { s += signal[j]; c++; }
+          }
+          binary[i] = signal[i] < (s / c) * 0.9 ? 0 : 255;
+        }
         const runs = getRuns(binary);
-        if (runs.length >= 10) {
+        if (runs.length >= 30) {
           const bits = runsToBits(runs);
           addResult(decodeEAN13Bits(bits));
         }
