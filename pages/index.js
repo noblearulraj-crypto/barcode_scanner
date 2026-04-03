@@ -14,6 +14,7 @@ export default function Home() {
   const [scanning, setScanning]       = useState(false);
   const [pass, setPass]               = useState(0);
   const [mode, setMode]               = useState('upload'); // 'upload' | 'camera'
+  const [hasScanned, setHasScanned]   = useState(false);
   const [previewSrc, setPreviewSrc]   = useState(null);
   const [dragOver, setDragOver]       = useState(false);
   const [cameraErr, setCameraErr]     = useState(null);
@@ -193,10 +194,11 @@ export default function Home() {
   };
 
   // ── Main scan pipeline ────────────────────────────────────────────────────
-  const runScan = useCallback(async (imgEl) => {
+  const runScan = useCallback(async (imgEl, currentSrc) => {
     setScanning(true);
     setResults([]);
     setPass(0);
+    setHasScanned(false);
     const all = [];
     const seen = new Set();
 
@@ -207,73 +209,80 @@ export default function Home() {
       setResults([...all].sort((a,b)=>b.confidence-a.confidence));
     };
 
-    // Pass 1 – direct
-    setPass(1);
-    const rawCanvas = document.createElement('canvas');
-    rawCanvas.width = imgEl.naturalWidth || imgEl.width;
-    rawCanvas.height = imgEl.naturalHeight || imgEl.height;
-    rawCanvas.getContext('2d').drawImage(imgEl, 0, 0);
-    addResult(await decodeCanvas(rawCanvas, 'raw|0°'));
+    try {
+      // Pass 1 – direct
+      setPass(1);
+      const rawCanvas = document.createElement('canvas');
+      rawCanvas.width = imgEl.naturalWidth || imgEl.width;
+      rawCanvas.height = imgEl.naturalHeight || imgEl.height;
+      rawCanvas.getContext('2d').drawImage(imgEl, 0, 0);
+      addResult(await decodeCanvas(rawCanvas, 'raw|0°'));
 
-    // Pass 2 – variants
-    setPass(2);
-    const variants = getImageVariants(imgEl);
-    for (const { canvas, label } of variants) {
-      addResult(await decodeCanvas(canvas, label));
-      await new Promise(r => setTimeout(r, 0)); // yield to UI
-    }
+      // Pass 2 – variants
+      setPass(2);
+      const variants = getImageVariants(imgEl);
+      for (const { canvas, label } of variants) {
+        addResult(await decodeCanvas(canvas, label));
+        await new Promise(r => setTimeout(r, 0)); // yield to UI
+      }
 
-    // Pass 3 – 1D projection
-    setPass(3);
-    for (const { canvas, label } of variants.slice(0, 8)) {
-      const signal = extractSignalFromCanvas(canvas);
-      const synth = document.createElement('canvas');
-      synth.width = signal.length; synth.height = 80;
-      const ctx = synth.getContext('2d');
-      const imgData = ctx.createImageData(signal.length, 80);
-      for (let y = 0; y < 80; y++) {
-        for (let x = 0; x < signal.length; x++) {
-          const v = signal[x] > 128 ? 255 : 0;
-          const i = (y * signal.length + x) * 4;
-          imgData.data[i] = imgData.data[i+1] = imgData.data[i+2] = v;
-          imgData.data[i+3] = 255;
+      // Pass 3 – 1D projection
+      setPass(3);
+      for (const { canvas, label } of variants.slice(0, 8)) {
+        const signal = extractSignalFromCanvas(canvas);
+        const synth = document.createElement('canvas');
+        synth.width = signal.length; synth.height = 80;
+        const ctx = synth.getContext('2d');
+        const imgData = ctx.createImageData(signal.length, 80);
+        for (let y = 0; y < 80; y++) {
+          for (let x = 0; x < signal.length; x++) {
+            const v = signal[x] > 128 ? 255 : 0;
+            const i = (y * signal.length + x) * 4;
+            imgData.data[i] = imgData.data[i+1] = imgData.data[i+2] = v;
+            imgData.data[i+3] = 255;
+          }
+        }
+        ctx.putImageData(imgData, 0, 0);
+        addResult(await decodeCanvas(synth, `1Dproj|${label}`));
+      }
+
+      // Pass 4 – manual EAN-13
+      setPass(4);
+      for (const { canvas } of variants.slice(0, 8)) {
+        const signal = extractSignalFromCanvas(canvas);
+        const binary = Uint8Array.from(signal, v => v > 128 ? 255 : 0);
+        const runs = getRuns(binary);
+        if (runs.length >= 10) {
+          const bits = runsToBits(runs);
+          addResult(decodeEAN13Bits(bits));
         }
       }
-      ctx.putImageData(imgData, 0, 0);
-      addResult(await decodeCanvas(synth, `1Dproj|${label}`));
-    }
+    } catch (err) {
+      console.error("Scan pipeline error:", err);
+    } finally {
+      setPass(0);
+      setScanning(false);
+      setHasScanned(true);
 
-    // Pass 4 – manual EAN-13
-    setPass(4);
-    for (const { canvas } of variants.slice(0, 8)) {
-      const signal = extractSignalFromCanvas(canvas);
-      const binary = Uint8Array.from(signal, v => v > 128 ? 255 : 0);
-      const runs = getRuns(binary);
-      if (runs.length >= 10) {
-        const bits = runsToBits(runs);
-        addResult(decodeEAN13Bits(bits));
+      if (all.length > 0) {
+        const sorted = [...all].sort((a,b)=>b.confidence-a.confidence);
+        setHistory(prev => [
+          { id: Date.now(), results: sorted, src: currentSrc },
+          ...prev.slice(0, 9)
+        ]);
       }
     }
-
-    setPass(0);
-    setScanning(false);
-
-    if (all.length > 0) {
-      setHistory(prev => [
-        { id: Date.now(), results: [...all].sort((a,b)=>b.confidence-a.confidence), src: previewSrc },
-        ...prev.slice(0, 9)
-      ]);
-    }
-  }, [decodeCanvas, getImageVariants, extractSignalFromCanvas, decodeEAN13Bits, previewSrc]);
+  }, [decodeCanvas, getImageVariants, extractSignalFromCanvas, decodeEAN13Bits]);
 
   // ── File / drop handlers ──────────────────────────────────────────────────
   const handleFile = useCallback((file) => {
     if (!file?.type.startsWith('image/')) return;
     const url = URL.createObjectURL(file);
     setPreviewSrc(url);
+    setHasScanned(false);
     setResults([]);
     const img = new Image();
-    img.onload = () => runScan(img);
+    img.onload = () => runScan(img, url);
     img.src = url;
   }, [runScan]);
 
@@ -304,6 +313,7 @@ export default function Home() {
             if (r?.getText()) {
               const res = { data: r.getText(), type: 'camera', method: 'live|zxing', confidence: 1.0, partial: false };
               setResults([res]);
+              setHasScanned(true);
               setHistory(prev=>[{ id:Date.now(), results:[res], src:c.toDataURL() }, ...prev.slice(0,9)]);
             }
           } catch (_) {}
@@ -328,6 +338,7 @@ export default function Home() {
     setMode(m);
     setResults([]);
     setPreviewSrc(null);
+    setHasScanned(false);
     if (m === 'camera') setTimeout(startCamera, 100);
   };
 
@@ -520,12 +531,22 @@ export default function Home() {
 
           {/* Right: Results */}
           <div>
-            {results.length === 0 && !scanning && (
+            {results.length === 0 && !scanning && !hasScanned && (
               <div style={{ padding:32, textAlign:'center', border:'1px solid var(--border)', borderRadius:12, background:'var(--surface)' }}>
                 <div style={{ fontSize:40, marginBottom:12, opacity:0.3 }}>⬛</div>
                 <p style={{ fontFamily:'var(--mono)', fontSize:11, color:'var(--muted)', letterSpacing:'0.06em' }}>
                   AWAITING INPUT
                 </p>
+              </div>
+            )}
+
+            {results.length === 0 && !scanning && hasScanned && (
+              <div style={{ padding:32, textAlign:'center', border:'1px solid var(--warn)', borderRadius:12, background:'rgba(255,170,0,0.04)' }}>
+                <div style={{ fontSize:40, marginBottom:12 }}>⚠</div>
+                <p style={{ fontFamily:'var(--mono)', fontSize:11, color:'var(--warn)', letterSpacing:'0.06em' }}>
+                  NO BARCODE DETECTED
+                </p>
+                <p style={{ fontFamily:'var(--mono)', fontSize:9, color:'var(--muted)', marginTop:8 }}>Try a clearer image or different angle.</p>
               </div>
             )}
 
