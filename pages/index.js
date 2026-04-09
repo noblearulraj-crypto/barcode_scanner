@@ -89,7 +89,7 @@ export default function Home() {
         ctx.drawImage(img, -dw / 2, -dh / 2, dw, dh);
         
         const labelSuffix = `${target}px|${deg}°`;
-        variants.push({ canvas: c, label: `raw|${labelSuffix}` });
+        variants.push({ canvas: padCanvas(c), label: `raw|${labelSuffix}` });
 
       // Grayscale + threshold
       const c2 = document.createElement('canvas');
@@ -97,25 +97,25 @@ export default function Home() {
       const ctx2 = c2.getContext('2d');
       ctx2.drawImage(c, 0, 0);
       const id = ctx2.getImageData(0, 0, c2.width, c2.height);
-      
-      // Faster Grayscale + Adaptive-like thresholding logic
+
+      // High-frequency grayscale conversion
       for (let i = 0; i < id.data.length; i += 4) {
         const v = id.data[i] * 0.299 + id.data[i+1] * 0.587 + id.data[i+2] * 0.114;
-        // Using a slightly lower threshold (110) often helps with thin 1D bars
-        const bw = v > 110 ? 255 : 0;
-        id.data[i] = id.data[i+1] = id.data[i+2] = bw;
+        id.data[i] = id.data[i+1] = id.data[i+2] = v;
       }
       ctx2.putImageData(id, 0, 0);
-      variants.push({ canvas: c2, label: `thresh|${labelSuffix}` });
+      variants.push({ canvas: c2, label: `gray|${labelSuffix}` });
 
-      // Pass 2.3: Deep Sharp (Unsharp Mask simulation)
-      // Extreme contrast and brightness tuning to fix blur-induced bleeding
+      // Pass 2.3: Adaptive Edge Enhancement
+      // This mimics the "unsharp mask" used in industrial scanners
       const c5 = document.createElement('canvas');
       c5.width = c.width; c5.height = c.height;
       const ctx5 = c5.getContext('2d');
-      ctx5.filter = 'grayscale(1) brightness(1.2) contrast(5) contrast(2)';
+      // Stacked filters to force edge detection:
+      // Grayscale -> Sharp Contrast -> Brightness Normalize -> Re-contrast
+      ctx5.filter = 'grayscale(1) contrast(3) brightness(1.2) contrast(2) saturate(0)';
       ctx5.drawImage(c, 0, 0);
-      variants.push({ canvas: c5, label: `edge|${labelSuffix}` });
+      variants.push({ canvas: padCanvas(c5), label: `edge|${labelSuffix}` });
 
       // Inverted (Required for some industrial markings/dark mode QRs)
       const c4 = document.createElement('canvas');
@@ -123,7 +123,7 @@ export default function Home() {
       const ctx4 = c4.getContext('2d');
       ctx4.filter = 'invert(1) grayscale(1) contrast(2)';
       ctx4.drawImage(c, 0, 0);
-      variants.push({ canvas: c4, label: `inv|${labelSuffix}` });
+      variants.push({ canvas: padCanvas(c4), label: `inv|${labelSuffix}` });
       });
     });
 
@@ -201,12 +201,13 @@ export default function Home() {
     const band = ctx.getImageData(0, startY, w, thickness);
     const signal = new Float32Array(w);
     for (let x = 0; x < w; x++) {
-      let sum = 0;
+      let maxV = 0;
       for (let y = 0; y < thickness; y++) {
         const idx = (y * w + x) * 4;
-        sum += band.data[idx]*0.299 + band.data[idx+1]*0.587 + band.data[idx+2]*0.114;
+        const v = band.data[idx]*0.299 + band.data[idx+1]*0.587 + band.data[idx+2]*0.114;
+        if (v > maxV) maxV = v; // Peak detection handles blurry lines better than averaging
       }
-      signal[x] = sum / thickness;
+      signal[x] = maxV;
     }
     return signal;
   }, []);
@@ -268,20 +269,27 @@ export default function Home() {
 
       // Pass 3 – 1D projection
       setPass(3);
-      // Scan 5 vertical positions across all variants to find a clear path
-      for (const { canvas, label } of variants.slice(0, 24)) {
-        for (const yOff of [0.2, 0.35, 0.5, 0.65, 0.8]) {
-          const signal = extractSignalFromCanvas(canvas, yOff);
+      // Dual-Axis scanning: Handles both horizontal and vertical bars
+      for (const { canvas, label } of variants.slice(0, 32)) {
+        for (const isHoriz of [true, false]) {
+          for (const off of [0.3, 0.5, 0.7]) {
+            const signal = extractSignalFromCanvas(canvas, off);
           
-          // Adaptive 1D Thresholding (the "CLI secret sauce")
+          // Proper 1D Adaptive Threshold (Bernsen's Method)
+          // Instead of a global mean, we look at local min/max in a sliding window.
+          // This is extremely effective against blur and uneven lighting.
           const binary = new Uint8Array(signal.length);
-          const win = Math.max(4, Math.floor(signal.length / 60));
+          const win = Math.max(5, Math.floor(signal.length / 100));
           for (let i = 0; i < signal.length; i++) {
-            let s = 0, c = 0;
+            let localMin = 255, localMax = 0;
             for (let j = i - win; j <= i + win; j++) {
-              if (j >= 0 && j < signal.length) { s += signal[j]; c++; }
+              if (j >= 0 && j < signal.length) {
+                if (signal[j] < localMin) localMin = signal[j];
+                if (signal[j] > localMax) localMax = signal[j];
+              }
             }
-            binary[i] = signal[i] < (s / c) * 0.92 ? 0 : 255;
+            const localThreshold = (localMin + localMax) / 2;
+            binary[i] = signal[i] < localThreshold ? 0 : 255;
           }
 
           const synth = document.createElement('canvas');
@@ -296,9 +304,11 @@ export default function Home() {
             }
           }
           ctx.putImageData(imgData, 0, 0);
-          addResult(await decodeCanvas(synth, `1D|${yOff}|${label}`));
+          addResult(await decodeCanvas(synth, `1D|${isHoriz?'H':'V'}|${off}|${label}`));
         }
+        await new Promise(r => setTimeout(r, 0)); // Keep UI alive
       }
+    }
 
       // Pass 4 – manual EAN-13
       setPass(4);
